@@ -7,118 +7,41 @@ Output: outputs/data/clean.parquet
 
 What it does:
   - Validates NCM format (8 digits); quarantines bad rows
-  - Detects unit-value outliers (IQR per NCM-4 group); flags, never drops
+  - Adds CO_POSICAO (first 4 chars of CO_NCM) and UNIT_FOB_PER_KG
+  - Detects unit-value outliers (IQR per NCM-4 group via DuckDB window funcs); flags, never drops
   - Flags zero-weight rows separately (unit-based goods)
-  - Marks period completeness (complete vs partial year-months)
+  - Marks period completeness dynamically: years with 12 distinct months = complete
+
+Analytical parameters (iqr_multiplier, min_ops_por_grupo) are read from
+Config/config.xlsx sheet 'outlier_detection' — edit there, not here.
 
 Run from project root:
     python pipeline/01_clean.py
 """
 
+import sys
 from pathlib import Path
 
-import numpy as np
+import duckdb
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-INPUT = PROJECT_ROOT / "outputs" / "data" / "raw_combined.parquet"
-OUT_CLEAN = PROJECT_ROOT / "outputs" / "data" / "clean.parquet"
-OUT_INVALID_NCM = PROJECT_ROOT / "outputs" / "data" / "invalid_ncm.parquet"
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from config import CONFIG_XLSX, OUTPUT_DIR
 
-# 2026 is a partial year — mark complete periods only through 2025-12
-# Update this set if 2026 data is refreshed with more months.
-KNOWN_COMPLETE_PERIODS = {
-    (2025, m) for m in range(1, 13)
-}
+INPUT           = OUTPUT_DIR / "raw_combined.parquet"
+OUT_CLEAN       = OUTPUT_DIR / "clean.parquet"
+OUT_INVALID_NCM = OUTPUT_DIR / "invalid_ncm.parquet"
 
 
-def validate_ncm(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Split into valid and invalid NCM rows. NCM must be exactly 8 digits."""
-    digits_only = df["CO_NCM"].str.replace(r"\D", "", regex=True)
-    valid_mask = digits_only.str.len() == 8
-    return df[valid_mask].copy(), df[~valid_mask].copy()
-
-
-def flag_outliers(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Compute UNIT_FOB_PER_KG and flag IQR outliers per NCM-4 group.
-
-    Rows where KG_LIQUIDO == 0 or VL_FOB == 0 get UNIT_FOB_PER_KG = NaN
-    and is_outlier_unitval = False (flagged separately by is_zero_weight).
-
-    IQR fence: Q1 - 3*IQR, Q3 + 3*IQR  (wide fence — only catches extreme
-    data-entry errors like grams vs. kg or single unit vs. full batch).
-    """
-    # Unit price — null when weight is zero to avoid division by zero
-    df["UNIT_FOB_PER_KG"] = np.where(
-        df["KG_LIQUIDO"] > 0,
-        df["VL_FOB"] / df["KG_LIQUIDO"],
-        np.nan,
+def _load_outlier_params() -> tuple[float, int]:
+    """Read iqr_multiplier and min_ops_por_grupo from config.xlsx."""
+    cfg = (
+        pd.read_excel(CONFIG_XLSX, sheet_name="outlier_detection")
+        .set_index("parametro")["valor"]
     )
-
-    df["CO_POSICAO"] = df["CO_NCM"].str[:4]  # NCM-4 for grouping
-
-    df["is_outlier_unitval"] = False
-
-    # Only flag rows that have a unit price
-    has_price = df["UNIT_FOB_PER_KG"].notna() & (df["VL_FOB"] > 0)
-    group_col = "CO_POSICAO"
-
-    def iqr_bounds(series: pd.Series) -> pd.Series:
-        q1 = series.quantile(0.25)
-        q3 = series.quantile(0.75)
-        iqr = q3 - q1
-        lo = q1 - 3 * iqr
-        hi = q3 + 3 * iqr
-        return (series < lo) | (series > hi)
-
-    # Vectorised group-level outlier flag
-    outlier_mask = (
-        df[has_price]
-        .groupby(group_col)["UNIT_FOB_PER_KG"]
-        .transform(iqr_bounds)
-        .reindex(df.index, fill_value=False)
-        .astype(bool)
-    )
-    df["is_outlier_unitval"] = outlier_mask
-
-    return df
-
-
-def flag_zero_weight(df: pd.DataFrame) -> pd.DataFrame:
-    """Flag rows where KG_LIQUIDO == 0 but VL_FOB > 0 (unit-based goods)."""
-    df["is_zero_weight"] = (df["KG_LIQUIDO"] == 0) | (df["KG_LIQUIDO"].isna())
-    return df
-
-
-def flag_period_completeness(df: pd.DataFrame) -> pd.DataFrame:
-    """Mark each row as belonging to a complete or partial period."""
-    df["is_complete_period"] = df.apply(
-        lambda r: (int(r["CO_ANO"]), int(r["CO_MES"])) in KNOWN_COMPLETE_PERIODS
-        if pd.notna(r["CO_ANO"]) and pd.notna(r["CO_MES"])
-        else False,
-        axis=1,
-    )
-    return df
-
-
-def print_summary(valid: pd.DataFrame, invalid: pd.DataFrame) -> None:
-    total = len(valid) + len(invalid)
-    print(f"\n  Total input rows   : {total:,}")
-    print(f"  Valid NCM rows     : {len(valid):,} ({100*len(valid)/total:.2f}%)")
-    print(f"  Invalid NCM rows   : {len(invalid):,} ({100*len(invalid)/total:.2f}%)")
-    if len(invalid) > 0:
-        print(f"  Sample bad NCMs    : {invalid['CO_NCM'].unique()[:10].tolist()}")
-
-    out_count = valid["is_outlier_unitval"].sum()
-    zero_w    = valid["is_zero_weight"].sum()
-    incomplete = (~valid["is_complete_period"]).sum()
-
-    print(f"\n  Outlier unit-value flags  : {out_count:,} ({100*out_count/len(valid):.2f}%)")
-    print(f"  Zero-weight flags         : {zero_w:,} ({100*zero_w/len(valid):.2f}%)")
-    print(f"  Incomplete-period rows    : {incomplete:,} ({100*incomplete/len(valid):.2f}%)")
+    return float(cfg["iqr_multiplier"]), int(cfg["min_ops_por_grupo"])
 
 
 def main() -> None:
@@ -127,48 +50,167 @@ def main() -> None:
     print("=" * 60)
 
     if not INPUT.exists():
-        raise FileNotFoundError(
-            f"{INPUT} not found. Run pipeline/00_ingest.py first."
-        )
+        raise FileNotFoundError(f"{INPUT} not found. Run pipeline/00_ingest.py first.")
 
-    print(f"\nReading {INPUT.name} ...")
-    df = pd.read_parquet(INPUT)
-    print(f"  Loaded {len(df):,} rows")
+    iqr_mult, min_ops = _load_outlier_params()
+    print(f"\nOutlier params: iqr_multiplier={iqr_mult}, min_ops_por_grupo={min_ops}")
 
-    # --- NCM validation ---
+    in_str = str(INPUT).replace("\\", "/")
+    con = duckdb.connect()
+    con.execute(f"CREATE OR REPLACE VIEW raw AS SELECT * FROM read_parquet('{in_str}')")
+
+    total_rows = con.execute("SELECT COUNT(*) FROM raw").fetchone()[0]
+    print(f"\nTotal input rows: {total_rows:,}")
+
+    # -------------------------------------------------------------------------
+    # NCM validation — quarantine rows where stripped digits != 8
+    # -------------------------------------------------------------------------
     print("\nValidating NCM format ...")
-    valid, invalid = validate_ncm(df)
 
-    # --- Derived flags ---
-    print("Flagging zero-weight rows ...")
-    valid = flag_zero_weight(valid)
+    # valid: 8 digit NCMs; add derived columns
+    valid_df = con.execute("""
+        SELECT *
+        FROM raw
+        WHERE length(regexp_replace(COALESCE(CO_NCM, ''), '[^0-9]', '', 'g')) = 8
+    """).df()
 
-    print("Flagging outlier unit values (IQR per NCM-4, wide fence 3×IQR) ...")
-    valid = flag_outliers(valid)
+    invalid_df = con.execute("""
+        SELECT *
+        FROM raw
+        WHERE length(regexp_replace(COALESCE(CO_NCM, ''), '[^0-9]', '', 'g')) != 8
+    """).df()
 
-    print("Flagging period completeness ...")
-    valid = flag_period_completeness(valid)
+    n_valid   = len(valid_df)
+    n_invalid = len(invalid_df)
+    print(f"  Valid   : {n_valid:,} ({100*n_valid/total_rows:.2f}%)")
+    print(f"  Invalid : {n_invalid:,} ({100*n_invalid/total_rows:.2f}%)")
+    if n_invalid > 0:
+        print(f"  Sample bad NCMs: {invalid_df['CO_NCM'].unique()[:10].tolist()}")
 
-    # --- Summary ---
-    print_summary(valid, invalid)
+    # -------------------------------------------------------------------------
+    # Derived columns on valid set — register as DuckDB relation
+    # -------------------------------------------------------------------------
+    con.register("valid_raw", valid_df)
 
-    # --- Write outputs ---
-    print(f"\nWriting {OUT_CLEAN} ...")
-    pq.write_table(
-        pa.Table.from_pandas(valid, preserve_index=False),
-        OUT_CLEAN,
-        compression="snappy",
-    )
-    print(f"  {len(valid):,} rows → {OUT_CLEAN.stat().st_size/1e6:.1f} MB")
+    # CO_POSICAO, UNIT_FOB_PER_KG, is_zero_weight
+    con.execute("""
+        CREATE OR REPLACE VIEW valid_derived AS
+        SELECT *,
+            LEFT(CO_NCM, 4)                                   AS CO_POSICAO,
+            CASE
+                WHEN KG_LIQUIDO > 0 THEN VL_FOB / KG_LIQUIDO
+                ELSE NULL
+            END                                               AS UNIT_FOB_PER_KG,
+            (KG_LIQUIDO = 0 OR KG_LIQUIDO IS NULL)           AS is_zero_weight
+        FROM valid_raw
+    """)
 
-    if len(invalid) > 0:
-        print(f"Writing {OUT_INVALID_NCM} ...")
-        pq.write_table(
-            pa.Table.from_pandas(invalid, preserve_index=False),
-            OUT_INVALID_NCM,
-            compression="snappy",
+    # -------------------------------------------------------------------------
+    # Period completeness — dynamic: years with 12 distinct months = complete
+    # -------------------------------------------------------------------------
+    print("Detecting complete periods dynamically ...")
+
+    period_rows = con.execute("""
+        SELECT CO_ANO, COUNT(DISTINCT CO_MES) AS n_months
+        FROM valid_derived
+        WHERE CO_ANO IS NOT NULL
+        GROUP BY CO_ANO
+    """).fetchall()
+
+    max_year = max((r[0] for r in period_rows), default=None)
+    complete_years = {r[0] for r in period_rows if r[1] == 12}
+
+    print(f"  Complete years (12 months): {sorted(complete_years)}")
+    if max_year and max_year not in complete_years:
+        partial_months = next(r[1] for r in period_rows if r[0] == max_year)
+        print(f"  Partial year {max_year}: data through month {partial_months} only")
+
+    complete_years_sql = ", ".join(str(y) for y in sorted(complete_years)) or "NULL"
+
+    con.execute(f"""
+        CREATE OR REPLACE VIEW valid_with_period AS
+        SELECT *,
+            (CO_ANO IN ({complete_years_sql})) AS is_complete_period
+        FROM valid_derived
+    """)
+
+    # -------------------------------------------------------------------------
+    # IQR outlier detection — DuckDB window functions, no pandas groupby
+    # Groups with < min_ops rows are excluded from outlier flagging
+    # -------------------------------------------------------------------------
+    print(f"Flagging outlier unit values (IQR × {iqr_mult} per NCM-4) ...")
+
+    con.execute(f"""
+        CREATE OR REPLACE VIEW valid_with_outliers AS
+        WITH group_stats AS (
+            SELECT
+                CO_POSICAO,
+                COUNT(*)                                                   AS grp_count,
+                PERCENTILE_CONT(0.25) WITHIN GROUP (ORDER BY UNIT_FOB_PER_KG) AS q1,
+                PERCENTILE_CONT(0.75) WITHIN GROUP (ORDER BY UNIT_FOB_PER_KG) AS q3
+            FROM valid_with_period
+            WHERE UNIT_FOB_PER_KG IS NOT NULL AND VL_FOB > 0
+            GROUP BY CO_POSICAO
+        ),
+        with_bounds AS (
+            SELECT
+                CO_POSICAO,
+                grp_count,
+                q1 - {iqr_mult} * (q3 - q1) AS lo,
+                q3 + {iqr_mult} * (q3 - q1) AS hi
+            FROM group_stats
+            WHERE grp_count >= {min_ops}
         )
-        print(f"  {len(invalid):,} rows quarantined")
+        SELECT
+            v.*,
+            CASE
+                WHEN v.UNIT_FOB_PER_KG IS NOT NULL
+                     AND v.VL_FOB > 0
+                     AND b.CO_POSICAO IS NOT NULL
+                     AND (v.UNIT_FOB_PER_KG < b.lo OR v.UNIT_FOB_PER_KG > b.hi)
+                THEN TRUE
+                ELSE FALSE
+            END AS is_outlier_unitval
+        FROM valid_with_period v
+        LEFT JOIN with_bounds b ON v.CO_POSICAO = b.CO_POSICAO
+    """)
+
+    # -------------------------------------------------------------------------
+    # Summary stats
+    # -------------------------------------------------------------------------
+    stats = con.execute("""
+        SELECT
+            SUM(CASE WHEN is_outlier_unitval THEN 1 ELSE 0 END)  AS n_outlier,
+            SUM(CASE WHEN is_zero_weight     THEN 1 ELSE 0 END)  AS n_zero_wt,
+            SUM(CASE WHEN NOT is_complete_period THEN 1 ELSE 0 END) AS n_incomplete
+        FROM valid_with_outliers
+    """).fetchone()
+    n_outlier, n_zero_wt, n_incomplete = stats
+
+    print(f"\n  Outlier unit-value flags  : {n_outlier:,} ({100*n_outlier/n_valid:.2f}%)")
+    print(f"  Zero-weight flags         : {n_zero_wt:,} ({100*n_zero_wt/n_valid:.2f}%)")
+    print(f"  Incomplete-period rows    : {n_incomplete:,} ({100*n_incomplete/n_valid:.2f}%)")
+
+    # -------------------------------------------------------------------------
+    # Write outputs
+    # -------------------------------------------------------------------------
+    clean_str   = str(OUT_CLEAN).replace("\\", "/")
+    invalid_str = str(OUT_INVALID_NCM).replace("\\", "/")
+
+    print(f"\nWriting {OUT_CLEAN.name} ...")
+    con.execute(f"""
+        COPY (SELECT * FROM valid_with_outliers)
+        TO '{clean_str}'
+        (FORMAT PARQUET, CODEC 'SNAPPY')
+    """)
+    size_mb = OUT_CLEAN.stat().st_size / 1e6
+    print(f"  {n_valid:,} rows → {size_mb:.1f} MB")
+
+    if n_invalid > 0:
+        print(f"Writing {OUT_INVALID_NCM.name} ...")
+        inv_tbl = pa.Table.from_pandas(invalid_df, preserve_index=False)
+        pq.write_table(inv_tbl, OUT_INVALID_NCM, compression="snappy")
+        print(f"  {n_invalid:,} rows quarantined")
     else:
         print("  No invalid NCM rows — invalid_ncm.parquet not created")
 
