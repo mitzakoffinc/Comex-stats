@@ -18,18 +18,35 @@ import matplotlib.ticker as mticker
 import numpy as np
 import pandas as pd
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+def _find_project_root() -> Path:
+    start = Path(globals().get("__file__", Path.cwd() / "x")).resolve().parent
+    for p in [start, *start.parents]:
+        if (p / "Config" / "config.xlsx").exists():
+            return p
+    raise FileNotFoundError("Project root not found (no Config/config.xlsx upward of cwd)")
+
+
+PROJECT_ROOT = _find_project_root()
 DATA_DIR     = PROJECT_ROOT / "outputs" / "data"
 CHART_DIR    = PROJECT_ROOT / "outputs" / "charts"
 CHART_DIR.mkdir(parents=True, exist_ok=True)
 
 plt.rcParams.update({"figure.dpi": 110, "figure.figsize": (12, 4)})
 
-CHINA_CODE = "160"
-
 print("Loading enriched data ...")
 enr = pd.read_parquet(DATA_DIR / "enriched.parquet")
 print(f"  Total rows: {len(enr):,}")
+
+# Resolve China code from data — no hardcoding
+_cn_match = enr.loc[enr["NO_PAIS_ING"].str.contains("China", case=False, na=False), "CO_PAIS"]
+CHINA_CODE = _cn_match.iloc[0] if len(_cn_match) else "160"
+print(f"  China CO_PAIS resolved: {CHINA_CODE}")
+
+# Dynamic period detection
+_months_per_year = enr.groupby("CO_ANO")["CO_MES"].nunique()
+_years           = sorted(int(y) for y in _months_per_year.index)
+PERIOD_LABEL     = f"{_years[0]}–{_years[-1]}" if len(_years) > 1 else str(_years[0])
+PARTIAL_YEARS    = {int(y): int(m) for y, m in _months_per_year.items() if m < 12}
 
 cn = enr[enr["CO_PAIS"] == CHINA_CODE].copy()
 print(f"  China rows: {len(cn):,}  ({100*len(cn)/len(enr):.1f}% of total)")
@@ -71,7 +88,9 @@ display_df = pd.DataFrame({
     "China kg share (%)": annual["CN_SHARE_KG_PCT"],
 })
 print(display_df.to_string())
-print("\nNote: 2026 is a partial year (~Q1 only). Totals are not YoY-comparable without annualizing.")
+for _yr, _m in sorted(PARTIAL_YEARS.items()):
+    print(f"\nNote: {_yr} is a partial year ({_m} months). "
+          "Totals are not YoY-comparable without annualizing.")
 
 # %%
 years  = annual.index.astype(str).tolist()
@@ -156,7 +175,7 @@ labels = [
 fig, ax = plt.subplots(figsize=(12, 6))
 bars = ax.barh(labels, top15["VL_FOB_mn"], color="#d62728", alpha=0.85)
 ax.set_xlabel("FOB USD (millions)")
-ax.set_title("Top 15 HS6 Segments — China Imports by FOB Value (2025–2026)")
+ax.set_title(f"Top 15 HS6 Segments — China Imports by FOB Value ({PERIOD_LABEL})")
 
 for bar in bars:
     ax.text(
@@ -305,8 +324,9 @@ plt.savefig(CHART_DIR / "china_mode_split.png", bbox_inches="tight")
 plt.show()
 
 # %% [markdown]
-# ## 6. Monthly Trend 2025 → 2026
-# Volume and FOB value over time. Use only for seasonality/direction signals — 2026 is a partial year (~Q1).
+# ## 6. Monthly Trend
+# Volume and FOB value over time. Use only for seasonality/direction signals — partial years
+# (detected dynamically) are shaded and must not be annualized without explicit adjustment.
 
 # %%
 monthly = (
@@ -314,6 +334,7 @@ monthly = (
     .agg(KG_LIQUIDO=("KG_LIQUIDO", "sum"), VL_FOB=("VL_FOB", "sum"), N_OPS=("VL_FOB", "count"))
     .reset_index()
     .sort_values(["CO_ANO", "CO_MES"])
+    .reset_index(drop=True)
 )
 monthly["PERIODO"] = (
     monthly["CO_ANO"].astype(str) + "-" + monthly["CO_MES"].astype(str).str.zfill(2)
@@ -332,23 +353,28 @@ axes[0].set_ylabel("FOB USD (millions)")
 axes[0].set_title("China Import Monthly Trend — FOB Value")
 axes[0].grid(axis="y", alpha=0.4)
 
-first_2026 = monthly.index[monthly["CO_ANO"] == 2026]
-if len(first_2026):
-    axes[0].axvspan(x[first_2026[0]] - 0.5, x[-1] + 0.5, alpha=0.07, color="gray", label="2026 partial")
+# Shade partial years (positional indexing — monthly is sorted and reindexed above)
+partial_positions = np.where(monthly["CO_ANO"].isin(PARTIAL_YEARS).values)[0]
+if len(partial_positions):
+    span = (partial_positions[0] - 0.5, partial_positions[-1] + 0.5)
+    axes[0].axvspan(*span, alpha=0.07, color="gray",
+                    label=f"partial year(s): {sorted(PARTIAL_YEARS)}")
     axes[0].legend(fontsize=8)
 
 axes[1].bar(x, monthly["KG_kMT"], color="#1f77b4", alpha=0.85)
 axes[1].set_ylabel("Net weight (thousand MT)")
 axes[1].set_title("China Import Monthly Trend — Net Weight")
 axes[1].grid(axis="y", alpha=0.4)
-if len(first_2026):
-    axes[1].axvspan(x[first_2026[0]] - 0.5, x[-1] + 0.5, alpha=0.07, color="gray")
+if len(partial_positions):
+    axes[1].axvspan(*span, alpha=0.07, color="gray")
 
 plt.xticks(x, labels, rotation=45, ha="right")
 plt.tight_layout()
 plt.savefig(CHART_DIR / "china_monthly_trend.png", bbox_inches="tight")
 plt.show()
-print("Shaded area = 2026 (partial year, ~Q1 only). Do not annualize without explicit adjustment.")
+if PARTIAL_YEARS:
+    print(f"Shaded area = partial year(s) {sorted(PARTIAL_YEARS)}. "
+          "Do not annualize without explicit adjustment.")
 
 # %% [markdown]
 # ## 7. Unit Value by HS6 — Pricing Intelligence

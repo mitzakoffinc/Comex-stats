@@ -26,10 +26,28 @@ INPUT  = OUTPUT_DIR / "clean.parquet"
 OUTPUT = OUTPUT_DIR / "enriched.parquet"
 
 
+# Code columns must stay VARCHAR: DuckDB's sniffer would otherwise infer integers
+# and strip leading zeros ("010121" -> 10121, "04" -> 4), silently breaking joins
+# and any LEFT()-based hierarchy slicing downstream.
+REF_TYPES = {
+    "NCM.csv":  {"CO_NCM": "VARCHAR", "CO_SH6": "VARCHAR",
+                 "CO_PPE": "VARCHAR", "CO_FAT_AGREG": "VARCHAR"},
+    "PAIS.csv": {"CO_PAIS": "VARCHAR", "CO_PAIS_ISON3": "VARCHAR"},
+    "URF.csv":  {"CO_URF": "VARCHAR"},
+    "VIA.csv":  {"CO_VIA": "VARCHAR"},
+    "UF.csv":   {"CO_UF": "VARCHAR", "SG_UF": "VARCHAR"},
+}
+
+
 def _csv(filename: str) -> str:
     """DuckDB read_csv expression for a reference CSV in Data/References/."""
     path = ref_path(filename)
-    return f"read_csv('{path}', sep=';', quote='\"', encoding='Latin-1', ignore_errors=true)"
+    types = REF_TYPES.get(filename, {})
+    types_sql = "{" + ", ".join(f"'{c}': '{t}'" for c, t in types.items()) + "}"
+    return (
+        f"read_csv('{path}', sep=';', quote='\"', encoding='Latin-1', "
+        f"types={types_sql}, ignore_errors=true)"
+    )
 
 
 def main() -> None:

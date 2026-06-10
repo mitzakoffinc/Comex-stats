@@ -8,9 +8,12 @@ Output: outputs/data/clean.parquet
 What it does:
   - Validates NCM format (8 digits); quarantines bad rows
   - Adds CO_POSICAO (first 4 chars of CO_NCM) and UNIT_FOB_PER_KG
-  - Detects unit-value outliers (IQR per NCM-4 group via DuckDB window funcs); flags, never drops
+  - Detects unit-value outliers (IQR per NCM-4 group); flags, never drops
   - Flags zero-weight rows separately (unit-based goods)
   - Marks period completeness dynamically: years with 12 distinct months = complete
+
+Everything runs as DuckDB SQL end-to-end — no pandas round-trip of the full
+dataset (only the small config sheet is read with pandas).
 
 Analytical parameters (iqr_multiplier, min_ops_por_grupo) are read from
 Config/config.xlsx sheet 'outlier_detection' — edit there, not here.
@@ -24,8 +27,6 @@ from pathlib import Path
 
 import duckdb
 import pandas as pd
-import pyarrow as pa
-import pyarrow.parquet as pq
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from config import CONFIG_XLSX, OUTPUT_DIR
@@ -33,6 +34,9 @@ from config import CONFIG_XLSX, OUTPUT_DIR
 INPUT           = OUTPUT_DIR / "raw_combined.parquet"
 OUT_CLEAN       = OUTPUT_DIR / "clean.parquet"
 OUT_INVALID_NCM = OUTPUT_DIR / "invalid_ncm.parquet"
+
+# Exactly 8 digits after stripping non-numerics
+VALID_NCM = "length(regexp_replace(COALESCE(CO_NCM, ''), '[^0-9]', '', 'g')) = 8"
 
 
 def _load_outlier_params() -> tuple[float, int]:
@@ -67,33 +71,26 @@ def main() -> None:
     # -------------------------------------------------------------------------
     print("\nValidating NCM format ...")
 
-    # valid: 8 digit NCMs; add derived columns
-    valid_df = con.execute("""
-        SELECT *
+    n_valid, n_invalid = con.execute(f"""
+        SELECT
+            SUM(CASE WHEN {VALID_NCM} THEN 1 ELSE 0 END),
+            SUM(CASE WHEN {VALID_NCM} THEN 0 ELSE 1 END)
         FROM raw
-        WHERE length(regexp_replace(COALESCE(CO_NCM, ''), '[^0-9]', '', 'g')) = 8
-    """).df()
+    """).fetchone()
+    n_valid, n_invalid = int(n_valid or 0), int(n_invalid or 0)
 
-    invalid_df = con.execute("""
-        SELECT *
-        FROM raw
-        WHERE length(regexp_replace(COALESCE(CO_NCM, ''), '[^0-9]', '', 'g')) != 8
-    """).df()
-
-    n_valid   = len(valid_df)
-    n_invalid = len(invalid_df)
     print(f"  Valid   : {n_valid:,} ({100*n_valid/total_rows:.2f}%)")
     print(f"  Invalid : {n_invalid:,} ({100*n_invalid/total_rows:.2f}%)")
     if n_invalid > 0:
-        print(f"  Sample bad NCMs: {invalid_df['CO_NCM'].unique()[:10].tolist()}")
+        samples = con.execute(f"""
+            SELECT DISTINCT CO_NCM FROM raw WHERE NOT ({VALID_NCM}) LIMIT 10
+        """).fetchall()
+        print(f"  Sample bad NCMs: {[r[0] for r in samples]}")
 
     # -------------------------------------------------------------------------
-    # Derived columns on valid set — register as DuckDB relation
+    # Derived columns on valid set
     # -------------------------------------------------------------------------
-    con.register("valid_raw", valid_df)
-
-    # CO_POSICAO, UNIT_FOB_PER_KG, is_zero_weight
-    con.execute("""
+    con.execute(f"""
         CREATE OR REPLACE VIEW valid_derived AS
         SELECT *,
             LEFT(CO_NCM, 4)                                   AS CO_POSICAO,
@@ -102,7 +99,8 @@ def main() -> None:
                 ELSE NULL
             END                                               AS UNIT_FOB_PER_KG,
             (KG_LIQUIDO = 0 OR KG_LIQUIDO IS NULL)           AS is_zero_weight
-        FROM valid_raw
+        FROM raw
+        WHERE {VALID_NCM}
     """)
 
     # -------------------------------------------------------------------------
@@ -135,7 +133,7 @@ def main() -> None:
     """)
 
     # -------------------------------------------------------------------------
-    # IQR outlier detection — DuckDB window functions, no pandas groupby
+    # IQR outlier detection per NCM-4 group
     # Groups with < min_ops rows are excluded from outlier flagging
     # -------------------------------------------------------------------------
     print(f"Flagging outlier unit values (IQR × {iqr_mult} per NCM-4) ...")
@@ -155,7 +153,6 @@ def main() -> None:
         with_bounds AS (
             SELECT
                 CO_POSICAO,
-                grp_count,
                 q1 - {iqr_mult} * (q3 - q1) AS lo,
                 q3 + {iqr_mult} * (q3 - q1) AS hi
             FROM group_stats
@@ -192,7 +189,7 @@ def main() -> None:
     print(f"  Incomplete-period rows    : {n_incomplete:,} ({100*n_incomplete/n_valid:.2f}%)")
 
     # -------------------------------------------------------------------------
-    # Write outputs
+    # Write outputs — straight from DuckDB, no pandas materialization
     # -------------------------------------------------------------------------
     clean_str   = str(OUT_CLEAN).replace("\\", "/")
     invalid_str = str(OUT_INVALID_NCM).replace("\\", "/")
@@ -208,8 +205,11 @@ def main() -> None:
 
     if n_invalid > 0:
         print(f"Writing {OUT_INVALID_NCM.name} ...")
-        inv_tbl = pa.Table.from_pandas(invalid_df, preserve_index=False)
-        pq.write_table(inv_tbl, OUT_INVALID_NCM, compression="snappy")
+        con.execute(f"""
+            COPY (SELECT * FROM raw WHERE NOT ({VALID_NCM}))
+            TO '{invalid_str}'
+            (FORMAT PARQUET, CODEC 'SNAPPY')
+        """)
         print(f"  {n_invalid:,} rows quarantined")
     else:
         print("  No invalid NCM rows — invalid_ncm.parquet not created")

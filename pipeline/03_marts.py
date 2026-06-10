@@ -9,9 +9,8 @@ All median/percentile stats exclude outlier unit-value rows.
 Sum totals (KG, FOB, CIF) always include outlier rows — they represent actual
 declared values.
 
-New mart in this version:
-  mart_ncm4_annual.parquet — NCM-4 × year, includes HHI and dominant mode/URF.
-  Required by notebooks/07_ncm_scoring.ipynb.
+mart_ncm4_annual.parquet — NCM-4 × year, includes n_months (period completeness),
+HHI, and dominant mode/URF. Required by notebooks/07_ncm_scoring.py.
 
 Run from project root:
     python pipeline/03_marts.py
@@ -48,30 +47,32 @@ def build_mart(
     Median/P10/P90 stats exclude is_outlier_unitval = TRUE rows.
     """
     gc = ", ".join(group_cols)
-    group_list = ", ".join(f"g.{c}" for c in group_cols)
 
-    freight_cols = """
-            MEDIAN(CASE WHEN NOT is_outlier_unitval THEN FREIGHT_PER_KG  END) AS MEDIAN_FREIGHT_PER_KG,
-            MEDIAN(CASE WHEN NOT is_outlier_unitval THEN FREIGHT_PCT_FOB END) AS MEDIAN_FREIGHT_PCT_FOB,
-    """ if include_freight else ""
+    select_parts = [
+        gc,
+        "SUM(KG_LIQUIDO)  AS KG_LIQUIDO",
+        "SUM(VL_FOB)      AS VL_FOB",
+        "SUM(VL_CIF)      AS VL_CIF",
+        "SUM(VL_FRETE)    AS VL_FRETE",
+        "COUNT(*)         AS N_OPS",
+        "MEDIAN(CASE WHEN NOT is_outlier_unitval THEN UNIT_FOB_PER_KG  END) AS MEDIAN_UNIT_FOB_PER_KG",
+        "APPROX_QUANTILE(CASE WHEN NOT is_outlier_unitval THEN UNIT_FOB_PER_KG END, 0.10) AS P10_UNIT_FOB_PER_KG",
+        "APPROX_QUANTILE(CASE WHEN NOT is_outlier_unitval THEN UNIT_FOB_PER_KG END, 0.90) AS P90_UNIT_FOB_PER_KG",
+    ]
+    if include_freight:
+        select_parts += [
+            "MEDIAN(CASE WHEN NOT is_outlier_unitval THEN FREIGHT_PER_KG  END) AS MEDIAN_FREIGHT_PER_KG",
+            "MEDIAN(CASE WHEN NOT is_outlier_unitval THEN FREIGHT_PCT_FOB END) AS MEDIAN_FREIGHT_PCT_FOB",
+        ]
+    if extra_aggs:
+        select_parts.append(extra_aggs)
 
     out_path = str(OUT / f"{name}.parquet").replace("\\", "/")
 
     con.execute(f"""
         COPY (
             SELECT
-                {gc},
-                SUM(KG_LIQUIDO)  AS KG_LIQUIDO,
-                SUM(VL_FOB)      AS VL_FOB,
-                SUM(VL_CIF)      AS VL_CIF,
-                SUM(VL_FRETE)    AS VL_FRETE,
-                COUNT(*)         AS N_OPS,
-                MEDIAN(CASE WHEN NOT is_outlier_unitval THEN UNIT_FOB_PER_KG  END) AS MEDIAN_UNIT_FOB_PER_KG,
-                APPROX_QUANTILE(CASE WHEN NOT is_outlier_unitval THEN UNIT_FOB_PER_KG END, 0.10) AS P10_UNIT_FOB_PER_KG,
-                APPROX_QUANTILE(CASE WHEN NOT is_outlier_unitval THEN UNIT_FOB_PER_KG END, 0.90) AS P90_UNIT_FOB_PER_KG,
-                {freight_cols}
-                {extra_aggs}
-                1 AS _placeholder
+                {", ".join(select_parts)}
             FROM enriched
             GROUP BY {gc}
             ORDER BY {gc}
@@ -89,8 +90,9 @@ def build_ncm4_annual(con: duckdb.DuckDBPyConnection) -> None:
     mart_ncm4_annual — NCM-4 × year.
 
     Includes HHI (Herfindahl-Hirschman Index of importers, proxied by URF share),
-    dominant transport mode, and dominant port-of-entry (URF).
-    Used by notebook 07_ncm_scoring.ipynb.
+    dominant transport mode, dominant port-of-entry (URF), and n_months
+    (distinct months with data — 12 = complete year).
+    Used by notebook 07_ncm_scoring.py.
 
     Note: SISCOMEX data does not include importer CNPJ at transaction level.
     HHI here is computed on URF (customs station) concentration as a structural
@@ -105,6 +107,7 @@ def build_ncm4_annual(con: duckdb.DuckDBPyConnection) -> None:
                 SELECT
                     CO_POSICAO,
                     CO_ANO,
+                    CO_MES,
                     CO_URF,
                     CO_VIA,
                     VL_FOB,
@@ -123,6 +126,7 @@ def build_ncm4_annual(con: duckdb.DuckDBPyConnection) -> None:
                     SUM(KG_LIQUIDO)  AS total_kg,
                     SUM(VL_CIF)      AS total_cif,
                     COUNT(*)         AS n_ops,
+                    COUNT(DISTINCT CO_MES) AS n_months,
                     COUNT(DISTINCT CO_URF) AS n_urfs,
                     MEDIAN(CASE WHEN NOT is_outlier_unitval THEN UNIT_FOB_PER_KG END) AS median_unit_fob,
                     MEDIAN(CASE WHEN NOT is_outlier_unitval THEN VL_FRETE / NULLIF(VL_FOB, 0) END) AS median_freight_pct
@@ -172,6 +176,7 @@ def build_ncm4_annual(con: duckdb.DuckDBPyConnection) -> None:
                 t.total_kg,
                 t.total_cif,
                 t.n_ops,
+                t.n_months,
                 t.n_urfs,
                 t.median_unit_fob,
                 t.median_freight_pct,
@@ -253,8 +258,8 @@ def main() -> None:
     print("Verification checklist:")
     print("  [ ] mart_chapter_month.parquet  — Chapter 30 (pharma) in top-10 by VL_FOB")
     print("  [ ] mart_ncm4_country.parquet   — CO_PAIS '160' (China) rows present")
-    print("  [ ] mart_sh6_via.parquet        — MEDIAN_FREIGHT_PCT_FOB populated for air (CO_VIA=4)")
-    print("  [ ] mart_ncm4_annual.parquet    — one row per CO_POSICAO × CO_ANO, hhi_urf populated")
+    print("  [ ] mart_sh6_via.parquet        — MEDIAN_FREIGHT_PCT_FOB populated for air (CO_VIA='04')")
+    print("  [ ] mart_ncm4_annual.parquet    — one row per CO_POSICAO × CO_ANO, hhi_urf and n_months populated")
     print("  [ ] No mart row count > enriched row count (no cartesian explosion)")
 
 

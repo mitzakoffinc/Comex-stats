@@ -7,6 +7,9 @@ and writes outputs/data/raw_combined.parquet.
 Dynamic: drop any correctly-formatted IMP_*.csv into the imports folder and re-run —
 no code changes needed.
 
+Malformed CSV lines are NOT silently dropped: rejected rows are counted per file
+and a sample of parse errors is printed (store_rejects).
+
 Run from project root:
     python pipeline/00_ingest.py
 """
@@ -44,13 +47,6 @@ def _types_map() -> str:
     return "{" + ", ".join(parts) + "}"
 
 
-def _read_expr(glob_str: str) -> str:
-    return (
-        f"read_csv('{glob_str}', sep=';', quote='\"', encoding='Latin-1', "
-        f"types={_types_map()}, ignore_errors=true)"
-    )
-
-
 def main() -> None:
     print("=" * 60)
     print("  STAGE 0 — INGEST & VALIDATE")
@@ -61,11 +57,43 @@ def main() -> None:
     for f in files:
         print(f"  {f.name}")
 
-    glob_str  = import_glob_str()
-    read_expr = _read_expr(glob_str)
+    glob_str = import_glob_str()
 
     con = duckdb.connect()
-    con.execute(f"CREATE OR REPLACE VIEW raw AS SELECT * FROM {read_expr}")
+
+    # Materialize once: profiling runs several queries and re-parsing ~GB of CSV
+    # per query is the slowest path. store_rejects captures malformed lines.
+    print("\nParsing CSVs (this is the slow step) ...")
+    con.execute(f"""
+        CREATE TABLE raw AS
+        SELECT * FROM read_csv(
+            '{glob_str}',
+            sep=';', quote='"', encoding='Latin-1',
+            types={_types_map()},
+            store_rejects=true
+        )
+    """)
+
+    # --- Rejected (malformed) rows — never silently dropped ---
+    rejects = con.execute("""
+        SELECT s.file_path, COUNT(*) AS n
+        FROM reject_errors e
+        JOIN reject_scans s USING (scan_id, file_id)
+        GROUP BY s.file_path
+        ORDER BY s.file_path
+    """).fetchall()
+
+    if rejects:
+        print("\n  *** REJECTED ROWS (failed to parse):")
+        for file_path, n in rejects:
+            print(f"      {Path(file_path).name}: {n:,} row(s)")
+        sample = con.execute(
+            "SELECT line, error_message FROM reject_errors LIMIT 3"
+        ).fetchall()
+        for line, msg in sample:
+            print(f"      e.g. line {line}: {msg[:120]}")
+    else:
+        print("  Rejected rows: 0 (all lines parsed)")
 
     # --- Per-year stats ---
     print("\nPer-year profile:")
@@ -161,7 +189,7 @@ def main() -> None:
     out_str = str(OUTPUT).replace("\\", "/")
     print(f"\nWriting {OUTPUT.name} ...")
     con.execute(f"""
-        COPY (SELECT * FROM raw)
+        COPY raw
         TO '{out_str}'
         (FORMAT PARQUET, CODEC 'SNAPPY')
     """)
